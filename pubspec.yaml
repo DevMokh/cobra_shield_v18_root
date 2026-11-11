@@ -1,0 +1,28 @@
+name: cobra_shield
+description: Cobra Shield - local scanner for suspicious links and phishing messages.
+publish_to: 'none'
+version: 1.11.0+13
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  shared_preferences: ^2.2.0
+  flutter_secure_storage: ^10.0.0
+  path_provider: ^2.1.5
+  crypto: ^3.0.3
+  mobile_scanner: ^7.3.0
+  google_mlkit_text_recognition: ^0.17.1
+  image_picker: ^1.2.4
+  share_plus: ^13.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
