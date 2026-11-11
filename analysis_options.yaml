@@ -1,0 +1,17 @@
+# إعدادات التحليل الثابت لـ Cobra Shield.
+#
+# متعمّد إننا ما بنعملش `include: package:flutter_lints/...` هنا: flutter_lints مش في dev_dependencies،
+# والـ include الناقص بيطلّع تحذير (include_file_not_found) كان مخفي سابقًا بـ --no-fatal-warnings.
+# القواعد الافتراضية للمحلل (أخطاء + تحذيرات) كافية كبوابة؛ وأي تحذير بيوقف الـ CI.
+#
+# لو حبيت تشدّد: أضف flutter_lints في dev_dependencies وفعّل الـ include بعد أول تشغيل نظيف.
+analyzer:
+  exclude:
+    - build/**
+    - android/**
+    - '**/*.g.dart'
+
+linter:
+  rules:
+    # ممنوع طباعة أي شيء (حماية إضافية: مفاتيح API ونص المستخدم ما يتسجلوش في اللوج).
+    - avoid_print
