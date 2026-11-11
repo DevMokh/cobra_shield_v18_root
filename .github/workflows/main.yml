@@ -1,0 +1,342 @@
+name: CI and Build APK
+
+# كل push بيشغّل: بوابة جودة (تنسيق + analyze + test) ثم بناء Debug APK تلقائيًا.
+# - Klencod بيرفع كل ملف في commit لوحده، فالـ concurrency بيلغي الـ runs القديمة وبيكمّل آخر واحد بس.
+# - التنسيق على push بيتطبّق جوه الـ runner بس (مفيش commit على الريبو، عشان ما يتعارضش مع نسخة الـ IDE).
+#   لو عايز نتيجة التنسيق تتعمل commit: شغّل الـ workflow يدويًا واختار commit_format.
+# - لو البوابة فشلت (analyze/test) الـ Debug APK بيتبني برضه لكن بيتسمّى app-debug-UNVERIFIED وفيه تحذير.
+#   Release مبيتبنيش إلا لو البوابة نجحت + أسرار التوقيع موجودة.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      flutter_version:
+        description: 'Flutter version'
+        required: true
+        default: '3.47.2'
+      build_type:
+        description: 'debug = للتجربة (بدون مفاتيح توقيع) | release = يتطلب أسرار التوقيع'
+        required: true
+        type: choice
+        default: debug
+        options:
+          - debug
+          - release
+      commit_format:
+        description: 'ارفع نتيجة dart format كـ commit على الريبو (تشغيل يدوي فقط)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: ${{ github.event.inputs.flutter_version || '3.47.2' }}
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1) البوابة: أي فشل هنا = لا يوجد APK.
+  # ------------------------------------------------------------------
+  verify:
+    name: Format, analyze, test
+    runs-on: ubuntu-24.04
+    # الكتابة مستخدمة بس لو شغّلت يدويًا بـ commit_format=true؛ باقي الـ jobs قراءة فقط.
+    permissions:
+      contents: write
+    outputs:
+      fmt_sha: ${{ steps.autofmt.outputs.sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+          channel: stable
+
+      - name: Show toolchain versions
+        run: |
+          flutter --version
+          dart --version
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      # الحل الفعلي للاعتماديات. لو مفيش pubspec.lock في المستودع، حمّل الملف ده من الـ artifacts
+      # وارفعه (commit) عشان البناء يبقى قابل للتكرار.
+      - name: Upload resolved pubspec.lock
+        if: ${{ always() && hashFiles('pubspec.lock') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pubspec-lock
+          path: pubspec.lock
+          if-no-files-found: warn
+          retention-days: 30
+
+      # push: dart format بيتطبّق جوه الـ runner بس والـ job بيكمّل على النسخة المنسّقة (مفيش كتابة على الريبو).
+      # تشغيل يدوي + commit_format=true: بيتعمل commit باسم github-actions[bot].
+      # pull_request: التنسيق شرط: أي ملف مش متنسّق = فشل (الإصلاح: dart format lib test).
+      - name: Format code
+        id: autofmt
+        env:
+          EVENT: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT_FORMAT: ${{ github.event.inputs.commit_format }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            dart format --output=none --set-exit-if-changed lib test
+            exit 0
+          fi
+          dart format lib test
+          if [ "$EVENT" != "workflow_dispatch" ] || [ "$COMMIT_FORMAT" != "true" ]; then
+            echo "formatted inside the runner only (nothing is committed to the repository)"
+            exit 0
+          fi
+          if git diff --quiet; then
+            echo "already formatted: nothing to commit"
+            exit 0
+          fi
+          git status --short
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A lib test
+          git commit -m "style: dart format (automatic)"
+          if git push origin "HEAD:${BRANCH}"; then
+            echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            echo "formatted and pushed"
+          else
+            echo "::warning::Could not push the formatting commit (protected branch or newer commits)."
+          fi
+
+      # إلزامي: أخطاء وتحذيرات بتوقف البناء. (--no-fatal-infos بس: الملاحظات الأسلوبية بتظهر في اللوج
+      # ومبتوقفش، لكن مفيش أي إخفاء للتحذيرات.)
+      - name: Analyze Dart code
+        run: flutter analyze --no-fatal-infos
+
+      # إلزامي: أي اختبار بيفشل = فشل الـ job.
+      - name: Run tests
+        run: flutter test --reporter expanded
+
+  # ------------------------------------------------------------------
+  # 2) البناء: بعد نجاح البوابة بس.
+  # ------------------------------------------------------------------
+  build:
+    name: Build APK
+    needs: verify
+    # Debug بيتبني حتى لو البوابة فشلت (بيتسمّى UNVERIFIED)؛ Release بيتطلب نجاح البوابة.
+    if: ${{ !cancelled() && (needs.verify.result == 'success' || (needs.verify.result == 'failure' && github.event.inputs.build_type != 'release')) }}
+    runs-on: ubuntu-24.04
+    # الأسرار مينفعش تتقري مباشرة جوه if، فبنمررها كمتغير بيئة ونفحص المتغير.
+    env:
+      KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+      BUILD_TYPE: ${{ github.event.inputs.build_type || 'debug' }}
+    steps:
+      # لو الـ verify عمل commit تنسيق تلقائي، البناء بيستخدمه (غير كده بيستخدم نفس الـ commit اللي اشتغل عليه الـ CI).
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.verify.outputs.fmt_sha || github.sha }}
+
+      - name: Warn when the quality gate failed
+        if: ${{ needs.verify.result != 'success' }}
+        run: echo "::warning::The quality gate (format/analyze/test) FAILED. This APK is for field testing only and is NOT verified."
+
+      # إصدار release لازم يتوقّع بمفتاحك الحقيقي. لو الأسرار ناقصة البناء بيفشل من أول خطوة.
+      - name: Require signing secrets for release
+        if: ${{ env.BUILD_TYPE == 'release' }}
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          missing=""
+          [ -n "$KEYSTORE_B64" ] || missing="$missing KEYSTORE_BASE64"
+          [ -n "$KEYSTORE_PASSWORD" ] || missing="$missing KEYSTORE_PASSWORD"
+          [ -n "$KEY_PASSWORD" ] || missing="$missing KEY_PASSWORD"
+          [ -n "$KEY_ALIAS" ] || missing="$missing KEY_ALIAS"
+          if [ -n "$missing" ]; then
+            echo "::error::Release build needs these repository secrets:$missing. Refusing to sign a release with the debug key. Use build_type=debug for a test build."
+            exit 1
+          fi
+          echo "signing secrets present"
+
+      - name: Setup Gradle Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+          channel: stable
+
+      # المشروع مرفوع بدون مجلد android، فنولّده هنا تلقائيًا (لو مش موجود).
+      # flutter create بيعيد كتابة pubspec.yaml و analysis_options.yaml وlib وtest، فبنحفظهم ونرجّعهم.
+      - name: Generate Android platform files (if missing)
+        run: |
+          if [ ! -f android/app/build.gradle ] && [ ! -f android/app/build.gradle.kts ]; then
+            echo "android/ not found: generating it"
+            keep=$(mktemp -d)
+            cp -r lib "$keep/lib"
+            cp pubspec.yaml "$keep/pubspec.yaml"
+            [ -f pubspec.lock ] && cp pubspec.lock "$keep/pubspec.lock" || true
+            [ -f analysis_options.yaml ] && cp analysis_options.yaml "$keep/analysis_options.yaml" || true
+            [ -d test ] && cp -r test "$keep/test" || true
+            flutter create . --platforms=android --org com.cobrashield --project-name cobra_shield
+            rm -rf lib pubspec.yaml pubspec.lock analysis_options.yaml test
+            cp -r "$keep/lib" lib
+            cp "$keep/pubspec.yaml" pubspec.yaml
+            [ -f "$keep/pubspec.lock" ] && cp "$keep/pubspec.lock" pubspec.lock || true
+            [ -f "$keep/analysis_options.yaml" ] && cp "$keep/analysis_options.yaml" analysis_options.yaml || true
+            [ -d "$keep/test" ] && cp -r "$keep/test" test || true
+          else
+            echo "android/ already exists: skipping"
+          fi
+
+      # Manifest (إذن الإنترنت + استقبال المشاركة + منع النسخ الاحتياطي) و MainActivity والأيقونة
+      - name: Apply Android overlay
+        run: |
+          APP=android/app/src/main
+          cp android_overlay/AndroidManifest.xml "$APP/AndroidManifest.xml"
+          mkdir -p "$APP/kotlin/com/cobrashield/cobra_shield"
+          cp android_overlay/MainActivity.kt "$APP/kotlin/com/cobrashield/cobra_shield/MainActivity.kt"
+          cp android_overlay/TesseractOcr.kt "$APP/kotlin/com/cobrashield/cobra_shield/TesseractOcr.kt"
+          cp android_overlay/proguard-rules.pro android/app/proguard-rules.pro
+          for d in android_overlay/res/mipmap-*; do
+            cp -r "$d" "$APP/res/"
+          done
+          echo "--- manifest ---"
+          head -20 "$APP/AndroidManifest.xml"
+          find android/app/src/main -name 'MainActivity.*'
+
+      # نماذج قراءة النص (عربي + إنجليزي) لمحرك Tesseract. بتتنزّل من نسخة مثبّتة
+      # (commit محدد) وبيتم التحقق من بصمة SHA-256 لكل ملف؛ لو الملف ناقص أو
+      # متغيّر البناء بيفشل بدل ما يطلع تطبيق بقراءة معطوبة.
+      - name: Fetch OCR language models (verified)
+        run: |
+          set -euo pipefail
+          ASSETS=android/app/src/main/assets/tessdata
+          mkdir -p "$ASSETS"
+          BASE=https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/87416418657359cb625c412a48b6e1d6d41c29bd
+          fetch() {
+            name="$1"; sum="$2"
+            for i in 1 2 3; do
+              if curl -fsSL --retry 3 --retry-delay 3 -o "$ASSETS/$name" "$BASE/$name" \
+                 && echo "$sum  $ASSETS/$name" | sha256sum -c -; then
+                return 0
+              fi
+              echo "attempt $i failed for $name"
+              sleep 5
+            done
+            echo "ERROR: could not fetch a verified $name" >&2
+            return 1
+          }
+          fetch ara.traineddata e3206d3dc87fd50c24a0fb9f01838615911d25168f4e64415244b67d2bb3e729
+          fetch eng.traineddata 7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2
+          ls -l "$ASSETS"
+
+      # توقيع الإصدار (release فقط): الأسرار بتتمرر كمتغيرات بيئة ومبتتطبعش في اللوج.
+      - name: Configure release signing
+        if: ${{ env.BUILD_TYPE == 'release' }}
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          umask 077
+          printf '%s' "$KEYSTORE_B64" | base64 -d > android/app/upload-keystore.jks
+          # key.properties بصيغة Java Properties: الباك سلاش لازم يتضاعف
+          # (وإلا كلمة سر فيها \ تتقرأ غلط)، والمسافة في أول القيمة بتتهرّب.
+          esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/^ /\\ /'; }
+          {
+            printf 'storePassword=%s\n' "$(esc "$KEYSTORE_PASSWORD")"
+            printf 'keyPassword=%s\n' "$(esc "$KEY_PASSWORD")"
+            printf 'keyAlias=%s\n' "$(esc "$KEY_ALIAS")"
+            printf 'storeFile=upload-keystore.jks\n'
+          } > android/key.properties
+          echo "release signing configured"
+
+      # يرفع minSdk لـ 24 (تحتاجه مكتبات الكاميرا/الصور) ويربط التوقيع أعلاه
+      # لو موجود، ويضيف مكتبة Tesseract (قراءة العربي). آمن حتى لو مفيش key.properties (يفضل بتوقيع debug).
+      - name: Patch Android Gradle (minSdk + signing + OCR)
+        run: |
+          GRADLE_FILE=android/app/build.gradle.kts
+          if [ ! -f "$GRADLE_FILE" ]; then GRADLE_FILE=android/app/build.gradle; fi
+          python3 android_overlay/patch_build_gradle.py "$GRADLE_FILE"
+
+      - name: Get dependencies
+        run: flutter pub get
+
+      - name: Read version from pubspec.yaml
+        id: ver
+        run: |
+          line=$(grep -m1 '^version:' pubspec.yaml)
+          name=$(printf '%s' "$line" | sed -n 's/^version:[[:space:]]*\([0-9][0-9.]*\)+\([0-9][0-9]*\)[[:space:]]*$/\1/p')
+          code=$(printf '%s' "$line" | sed -n 's/^version:[[:space:]]*\([0-9][0-9.]*\)+\([0-9][0-9]*\)[[:space:]]*$/\2/p')
+          if [ -z "$name" ] || [ -z "$code" ]; then
+            echo "::error::pubspec.yaml version must look like 1.2.3+4 (got: $line)"
+            exit 1
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+      - name: Build debug APK
+        if: ${{ env.BUILD_TYPE == 'debug' }}
+        run: flutter build apk --debug --target-platform android-arm,android-arm64
+
+      - name: Build release APK (signed)
+        if: ${{ env.BUILD_TYPE == 'release' }}
+        run: flutter build apk --release --target-platform android-arm,android-arm64 --obfuscate --split-debug-info=build/symbols
+
+      # لا نعتبر البناء ناجحًا قبل ما نتأكد إن الملف موجود وسليم وبإصدار pubspec وتوقيعه صحيح.
+      - name: Verify APK (exists, valid, version, permissions, signature)
+        id: verifyapk
+        run: |
+          chmod +x tool/verify_apk.sh
+          tool/verify_apk.sh \
+            "build/app/outputs/flutter-apk/app-${BUILD_TYPE}.apk" \
+            "${{ steps.ver.outputs.name }}" \
+            "${{ steps.ver.outputs.code }}" \
+            "${BUILD_TYPE}"
+
+      # بيترفع حتى لو verify_apk.sh فشل (الـ job بيفضل أحمر)، والاسم بيوضّح لو مش متحقق منه.
+      - name: Upload APK
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ env.BUILD_TYPE }}${{ (needs.verify.result != 'success' || steps.verifyapk.outcome != 'success') && '-UNVERIFIED' || '' }}
+          path: build/app/outputs/flutter-apk/app-${{ env.BUILD_TYPE }}.apk
+          if-no-files-found: error
+          retention-days: 7
+
+      # رموز إلغاء التشويش (للـ release بس): بدونها مش هتقدر تقرأ stack traces لاحقًا.
+      - name: Upload obfuscation symbols (release only)
+        if: ${{ env.BUILD_TYPE == 'release' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: symbols-release
+          path: build/symbols
+          if-no-files-found: error
+          retention-days: 30
